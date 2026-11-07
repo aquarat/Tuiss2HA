@@ -32,6 +32,9 @@ from .const import (
     DeviceNotFound,
     ConnectionTimeout,
     NoConnectableBluetoothAdapter,
+    BLE_CONNECT_TIMEOUT,
+    BLE_DISCONNECT_TIMEOUT,
+    BLE_GATT_TIMEOUT,
     TIMEOUT_SECONDS,
     CMD_STOP,
     CMD_BATTERY_STATUS,
@@ -113,6 +116,10 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         self._position_on_restart: bool | None = None
         self._blind_speed: str | None = None
         self._locked = False
+        # Identifies the operation holding _locked. Stop and force unlock can free the
+        # blind while that operation is still unwinding; this stops it acting on the
+        # lock of whatever runs next.
+        self._lock_owner: object | None = None
         self._attr_traversal_speed: float | None = None
         self._last_connection_error: str | None = None  # For logging when connection fails
         # Battery check configuration
@@ -169,6 +176,65 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         """Remove previously registered callback."""
         self._callbacks.discard(callback)
 
+
+    ##################################################################################################
+    ## LOCK METHODS ##################################################################################
+    ##################################################################################################
+
+    def _acquire_lock(self) -> object:
+        """Take the lock for one operation, or raise device_locked if it is held.
+
+        The caller must pass the returned owner to _async_release_lock in a finally
+        block, so that the lock is released on every exit including cancellation.
+        """
+        if self._locked:
+            _LOGGER.debug("%s: Device is busy", self.name)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="device_locked",
+                translation_placeholders={"name": self.name},
+            )
+        owner = object()
+        self._lock_owner = owner
+        self._locked = True
+        self.publish_updates()
+        return owner
+
+    def _owns_lock(self, owner: object) -> bool:
+        """Return True if this operation still holds the lock."""
+        return self._locked and self._lock_owner is owner
+
+    async def _async_release_lock(self, owner: object) -> None:
+        """Close the connection, then release the lock if the operation still holds it.
+
+        The lock stays held during the disconnect so that no new command can find a
+        link that is about to close. The inner finally releases it even if the
+        disconnect fails or a second cancellation arrives.
+        """
+        try:
+            await self.disconnect(owner=owner)
+        except Exception as e:
+            _LOGGER.warning("%s: Error closing the connection: %s", self.name, e)
+        finally:
+            if self._owns_lock(owner):
+                self._locked = False
+                self._lock_owner = None
+                self.publish_updates()
+                _LOGGER.debug("%s: Lock released.", self.name)
+
+    def force_unlock(self) -> None:
+        """Free the blind and wake whatever is waiting on it.
+
+        An operation still running sees that it no longer owns the lock and winds
+        down without touching the state of anything that starts after this.
+        """
+        self._is_stopping = True
+        self._moving = 0
+        self._locked = False
+        self._lock_owner = None
+        self._stopped_event.set()
+        self._read_response_event.set()
+        self.publish_updates()
 
     ##################################################################################################
     ## CONNECTION METHODS ############################################################################
@@ -258,19 +324,20 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         assert self._ble_device is not None
         device = self._ble_device
         try:
-            client: BleakClientWithServiceCache = await establish_connection(
-                client_class=BleakClientWithServiceCache,
-                device=device,
-                name=self.host,
-                use_services_cache=True,
-                max_attempts=1,
-                ble_device_callback=lambda: device,
-            )
+            async with asyncio.timeout(BLE_CONNECT_TIMEOUT):
+                client: BleakClientWithServiceCache = await establish_connection(
+                    client_class=BleakClientWithServiceCache,
+                    device=device,
+                    name=self.host,
+                    use_services_cache=True,
+                    max_attempts=1,
+                    ble_device_callback=lambda: device,
+                )
             self._client = client
             self._notify_registered = False  # fresh connection has no subscriptions
-            
+
             # send the maintain connection message
-            await self._client.write_gatt_char(UUID, bytes.fromhex(CONNECTION_MESSAGE))
+            await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))
 
             # send the connection timestamp message
             await self.send_timestamp()
@@ -282,21 +349,26 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
                 self._moving,
             )
         except (BleakError, asyncio.TimeoutError) as e:
-            self._last_connection_error = f"{dt_util.now().strftime('%Y-%m-%d %H:%M:%S')}: {e}"
+            self._last_connection_error = (
+                f"{dt_util.now().strftime('%Y-%m-%d %H:%M:%S')}: {e or type(e).__name__}"
+            )
             _LOGGER.debug("Failed to connect to blind: %s", e)
         except Exception as e:
             self._last_connection_error = f"{dt_util.now().strftime('%Y-%m-%d %H:%M:%S')}: {type(e).__name__}: {e}"
             _LOGGER.debug("%s: Unexpected error during connect: %s", self.name, e)
 
     # Disconnect
-    async def disconnect(self):
-        """Disconnect from the blind."""
+    async def disconnect(self, owner: object | None = None):
+        """Disconnect from the blind, unless another operation is using the link.
+
+        The operation holding the lock passes itself as owner to close its own link.
+        """
 
         if self._limits_heartbeat_task:
             self._limits_heartbeat_task.cancel()
             self._limits_heartbeat_task = None
 
-        if self._locked:
+        if self._locked and not self._owns_lock(owner):
             _LOGGER.debug("%s: Skipping BLE disconnect — move is in progress", self.name)
             return
 
@@ -309,12 +381,20 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         _LOGGER.debug("%s: Disconnecting", self.name)
         try:
             try:
-                await client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+                async with asyncio.timeout(BLE_DISCONNECT_TIMEOUT):
+                    await client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
             except Exception as notify_ex:
                 _LOGGER.debug("%s: Could not stop notifications: %s", self.name, notify_ex)
             finally:
                 self._notify_registered = False
-            await client.disconnect()
+            async with asyncio.timeout(BLE_DISCONNECT_TIMEOUT):
+                await client.disconnect()
+        except asyncio.TimeoutError:
+            # The link's state is unknown. Drop the client so the next operation makes
+            # a fresh connection rather than reusing this one as "already connected".
+            _LOGGER.warning("%s: Timeout disconnecting", self.name)
+            if self._client is client:
+                self._client = None
         except BLEAK_RETRY_EXCEPTIONS as ex:
             _LOGGER.warning(
                 "%s: Error disconnecting: %s",
@@ -346,19 +426,22 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         """Safely start notifications on the blind notify characteristic."""
         assert self._client is not None
         try:
-            await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
+            async with asyncio.timeout(BLE_GATT_TIMEOUT):
+                await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
             self._notify_registered = True
-        except BleakError as e:
+        except (BleakError, asyncio.TimeoutError) as e:
             _LOGGER.debug("%s: Failed to start notify: %s. Attempting restart.", self.name, e)
             try:
-                await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+                async with asyncio.timeout(BLE_GATT_TIMEOUT):
+                    await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
             except Exception:
                 pass
             self._notify_registered = False
             try:
-                await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
+                async with asyncio.timeout(BLE_GATT_TIMEOUT):
+                    await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
                 self._notify_registered = True
-            except BleakError as retry_err:
+            except (BleakError, asyncio.TimeoutError) as retry_err:
                 _LOGGER.warning("%s: Could not establish notifications: %s", self.name, retry_err)
                 raise HomeAssistantError(
                     f"{self.name}: Could not establish BLE notifications — characteristic not found"
@@ -396,24 +479,13 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
             if self._client and self._client.is_connected:
                 await self.send_command(UUID, bytes.fromhex(CMD_STOP))
         finally:
-            self._moving = 0
-            self._locked = False
-            self._stopped_event.set()
-            self._read_response_event.set()
-            self.publish_updates()
+            self.force_unlock()
 
 
 
     async def set_speed(self) -> None:
         """Set the speed for supported blind types"""
         _LOGGER.debug("%s: Attempting to set the blind speed", self.name)
-        if self._locked:
-            _LOGGER.debug("%s: Device is busy — cannot set blind speed", self.name)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="device_locked",
-                translation_placeholders={"name": self.name},
-            )
 
         match self._blind_speed:
             case "Standard":
@@ -432,9 +504,7 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
                 )
                 return
 
-        self._locked = True
-        self.publish_updates()
-
+        owner = self._acquire_lock()
         try:
             await self.ensure_connected()
 
@@ -447,9 +517,7 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
                 "Unable to set the speed. Check has enough battery and within bluetooth range or that blind supports speed changes"
             ) from e
         finally:
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
+            await self._async_release_lock(owner)
 
 
     ##################################################################################################
@@ -481,46 +549,25 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
 
     async def get_battery_status(self, from_move: bool = False) -> None:
         """Get the battery state from the blind as good or bad."""
-        if not from_move:
-            if self._locked:
-                _LOGGER.debug("%s: Device is busy — cannot query battery", self.name)
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="device_locked",
-                    translation_placeholders={"name": self.name},
-                )
-            self._locked = True
-            self.publish_updates()
+        owner = None if from_move else self._acquire_lock()
 
         try:
             command = bytes.fromhex(CMD_BATTERY_STATUS)
             await self.get_from_blind(command, self.battery_callback)
         finally:
-            if not from_move:
-                self._locked = False
-                self.publish_updates()
-                await self.disconnect()
+            if owner is not None:
+                await self._async_release_lock(owner)
 
 
     async def get_blind_position(self) -> None:
         """Get the current position of the blind."""
-        if self._locked:
-            _LOGGER.debug("%s: Device is busy — cannot query position", self.name)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="device_locked",
-                translation_placeholders={"name": self.name},
-            )
-        self._locked = True
-        self.publish_updates()
+        owner = self._acquire_lock()
 
         try:
             command = bytes.fromhex(INITIALIZATION_MESSAGE)
             await self.get_from_blind(command, self.position_callback)
         finally:
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
+            await self._async_release_lock(owner)
 
     ##################################################################################################
     ## CALLBACK METHODS ##############################################################################
@@ -610,7 +657,11 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
             )
             try:
                 _LOGGER.debug("%s: Sending the command %s", self.name, command.hex())
-                await self._client.write_gatt_char(UUID, command)
+                async with asyncio.timeout(BLE_GATT_TIMEOUT):
+                    await self._client.write_gatt_char(UUID, command)
+            except asyncio.TimeoutError as e:
+                _LOGGER.error("%s: Send Command timed out", self.name)
+                raise RuntimeError(f"{self.name}: BLE write timed out") from e
             except BleakError as e:
                 _LOGGER.error("%s: Send Command error: %s", self.name, e)
                 raise RuntimeError(e) from e
@@ -632,10 +683,9 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         """Cancel any pending post-move position queries."""
         if self._post_move_task and not self._post_move_task.done():
             self._post_move_task.cancel()
-            try:
-                await self._post_move_task
-            except asyncio.CancelledError:
-                pass
+            # asyncio.wait never raises the task's own outcome, so a CancelledError
+            # here is a cancellation of this move and is left to propagate.
+            await asyncio.wait({self._post_move_task}, timeout=BLE_DISCONNECT_TIMEOUT)
             self._post_move_task = None
 
     def _schedule_post_move_query(self, delay: float = 5.0) -> None:
@@ -717,78 +767,66 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
         target_position,
         skip_battery_check=False
     ):
-        """Move the cover."""
-        _LOGGER.debug("%s: Entering async_move_cover. Locked: %s", self.name, self._locked)
-        if self._locked:
-            _LOGGER.debug(
-                "%s is locked, please wait for currrent command to complete and then try again.",
-                self.name,
-            )
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="device_locked",
-                translation_placeholders={"name": self.name},
-            )
+        """Move the cover, returning once the motor has stopped.
 
-        # Acquire lock and set moving state immediately before any awaitable call.
-        # This provides instant UI feedback and locks out duplicate or stacked commands.
-        self._locked = True
+        The lock is taken before any awaitable call. This gives instant UI feedback
+        and locks out duplicate or stacked commands. Every way out of _async_run_move,
+        including cancellation of the service call, passes through the finally below.
+        """
+        _LOGGER.debug("%s: Entering async_move_cover. Locked: %s", self.name, self._locked)
+        owner = self._acquire_lock()
         _LOGGER.debug("%s: Lock acquired.", self.name)
         self._is_stopping = False
         self._moving = movement_direction
         if self._current_cover_position is None:
             self._current_cover_position = 0.0
-        start_position = self._current_cover_position
-        corrected_target_position = 100 - target_position
-        self.publish_updates()
 
         try:
-            # Cancel any background position task from previous move
-            await self._cancel_post_move_task()
-
-            await self.attempt_connection()
-            if not (self._client and self._client.is_connected):
+            await self._async_run_move(
+                owner, movement_direction, target_position, skip_battery_check
+            )
+        finally:
+            if self._owns_lock(owner):
                 self._moving = 0
-                self._locked = False
-                self.publish_updates()
-                return
+            await self._async_release_lock(owner)
+            _LOGGER.debug("%s: Finished async_move_cover.", self.name)
 
-            if self._is_stopping or not self._locked:
-                _LOGGER.debug(
-                    "%s: Movement aborted before start (is_stopping=%s, locked=%s)",
-                    self.name,
-                    self._is_stopping,
-                    self._locked,
-                )
-                self._is_stopping = False
-                self._moving = 0
-                self._locked = False
-                self.publish_updates()
-                await self.disconnect()
-                return
+    def _move_aborted(self, owner: object) -> bool:
+        """Return True if Stop or force unlock took the blind from this move."""
+        if self._owns_lock(owner) and not self._is_stopping:
+            return False
+        _LOGGER.debug(
+            "%s: Movement aborted before start (is_stopping=%s, locked=%s)",
+            self.name,
+            self._is_stopping,
+            self._locked,
+        )
+        if self._owns_lock(owner) or not self._locked:
+            self._is_stopping = False
+        return True
 
-            if not skip_battery_check:
-                await self._async_check_battery_if_due()
+    async def _async_run_move(
+        self, owner, movement_direction, target_position, skip_battery_check
+    ) -> None:
+        """Connect, send the move and wait for the motor. Lock handling is the caller's."""
+        start_position = self._current_cover_position
+        corrected_target_position = 100 - target_position
 
-            if self._is_stopping or not self._locked:
-                _LOGGER.debug(
-                    "%s: Movement aborted before start (is_stopping=%s, locked=%s)",
-                    self.name,
-                    self._is_stopping,
-                    self._locked,
-                )
-                self._is_stopping = False
-                self._moving = 0
-                self._locked = False
-                self.publish_updates()
-                await self.disconnect()
-                return
-        except Exception:
-            self._moving = 0
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
-            raise
+        # Cancel any background position task from previous move
+        await self._cancel_post_move_task()
+
+        await self.attempt_connection()
+        if not (self._client and self._client.is_connected):
+            return
+
+        if self._move_aborted(owner):
+            return
+
+        if not skip_battery_check:
+            await self._async_check_battery_if_due()
+
+        if self._move_aborted(owner):
+            return
 
         self._stopped_event.clear()
         move_sent = False
@@ -812,10 +850,6 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
                 break
 
         if not move_sent:
-            self._moving = 0
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
             return
 
         start_time = dt_util.now()
@@ -846,14 +880,12 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
             await asyncio.wait_for(self.wait_for_stop(), timeout=timeout_duration)
         except asyncio.TimeoutError:
             _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
-            self.set_final_state(corrected_target_position)
-            self._schedule_post_move_query(delay=3)
+            if self._owns_lock(owner):
+                self.set_final_state(corrected_target_position)
+                self._schedule_post_move_query(delay=3)
             return
         finally:
             update_task.cancel()
-            self._locked = False
-            await self.disconnect()
-            _LOGGER.debug("%s: Lock released in async_move_cover.", self.name)
 
         _LOGGER.debug(
             "%s: Finished moving. StartPos: %s. CurrentPos: %s. TargetPos: %s. is_stopping: %s",
@@ -868,8 +900,6 @@ class TuissBlind(TuissLimitsMixin, TuissTimersMixin, TuissPresetsMixin):
             self.update_traversal_speed(
                 corrected_target_position, start_position, start_time, end_time
             )
-            self._moving = 0
-            self.publish_updates()
         else:
             self._is_stopping = False
             self._schedule_post_move_query(delay=2)

@@ -10,6 +10,16 @@ SPEED_CONTROL_SUPPORTED_MODELS = ["TS5200","TS5101","TS5001","TS2600"]
 
 TIMEOUT_SECONDS = 120
 TRAVERSAL_UPDATE_THRESHOLD = 5
+
+# Backstops for radio calls made while a blind's lock is held. Each sits just above
+# the limit of the library underneath (bleak-retry-connector's 60s per connection
+# attempt, aioesphomeapi's 30s per GATT operation and 20s per disconnect), so the
+# library's own, better error normally arrives first. BlueZ GATT calls have no limit
+# of their own. They exist so a radio that never answers cannot hold the lock.
+BLE_CONNECT_TIMEOUT = 75
+BLE_GATT_TIMEOUT = 35
+BLE_DISCONNECT_TIMEOUT = 25
+
 BLIND_NOTIFY_CHARACTERISTIC = "00010304-0405-0607-0809-0a0b0c0d1910"
 CONNECTION_MESSAGE = "ff03030303787878787878"
 INITIALIZATION_MESSAGE = "ff78ea41d10301"

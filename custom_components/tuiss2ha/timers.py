@@ -11,6 +11,8 @@ from . import hub
 from .const import (
     DOMAIN,
     UUID,
+    BLE_DISCONNECT_TIMEOUT,
+    BLE_GATT_TIMEOUT,
     BLIND_NOTIFY_CHARACTERISTIC,
     CONNECTION_MESSAGE,
     INITIALIZATION_MESSAGE,
@@ -50,15 +52,7 @@ class TuissTimersMixin:
         self, days: list[str], time_str: str, position: float
     ) -> str:
         """Add a new schedule to the blind firmware."""
-        if self._locked:
-            _LOGGER.debug("%s: Device is busy — cannot add timer", self.name)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="device_locked",
-                translation_placeholders={"name": self.name},
-            )
-        self._locked = True
-        self.publish_updates()
+        owner = self._acquire_lock()
 
         try:
             await self.ensure_connected()
@@ -83,10 +77,10 @@ class TuissTimersMixin:
             try:
                 await asyncio.wait_for(timer_id_event.wait(), timeout=10.0)
             except asyncio.TimeoutError:
-                await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
                 raise HomeAssistantError("Timeout waiting for timer ID from blind.")
 
-            await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+            async with asyncio.timeout(BLE_GATT_TIMEOUT):
+                await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
 
             _LOGGER.debug("Received timer ID from blind: %s", new_timer_id)
 
@@ -130,21 +124,11 @@ class TuissTimersMixin:
             )
             return timer_id
         finally:
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
+            await self._async_release_lock(owner)
 
     async def async_delete_timer(self, timer_id: str) -> None:
         """Remove an existing schedule from the blind firmware."""
-        if self._locked:
-            _LOGGER.debug("%s: Device is busy — cannot delete timer", self.name)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="device_locked",
-                translation_placeholders={"name": self.name},
-            )
-        self._locked = True
-        self.publish_updates()
+        owner = self._acquire_lock()
 
         try:
             await self.ensure_connected()
@@ -164,22 +148,12 @@ class TuissTimersMixin:
                     f"{DOMAIN}_delete_timer_{self.blind_id}_{timer_id}",
                 )
         finally:
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
+            await self._async_release_lock(owner)
 
     async def delete_all_timers(self) -> None:
         """Delete all schedules from the blind firmware."""
         _LOGGER.debug("%s: Attempting to delete all timers.", self.name)
-        if self._locked:
-            _LOGGER.debug("%s: Device is busy — cannot delete all timers", self.name)
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="device_locked",
-                translation_placeholders={"name": self.name},
-            )
-        self._locked = True
-        self.publish_updates()
+        owner = self._acquire_lock()
 
         try:
             await self.ensure_connected()
@@ -190,7 +164,8 @@ class TuissTimersMixin:
             await self.send_command(UUID, bytes.fromhex(CMD_TIMER_RESET))
 
             if self._client:
-                await self._client.disconnect()
+                async with asyncio.timeout(BLE_DISCONNECT_TIMEOUT):
+                    await self._client.disconnect()
                 self._client = None
 
             await self.attempt_connection()
@@ -207,6 +182,4 @@ class TuissTimersMixin:
                 self.timers.clear()
                 await self.async_save_timer()
         finally:
-            self._locked = False
-            self.publish_updates()
-            await self.disconnect()
+            await self._async_release_lock(owner)
